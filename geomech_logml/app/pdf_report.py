@@ -136,9 +136,15 @@ def _coverage_png(result, alpha: float) -> io.BytesIO:
     return _fig_to_bytes(fig)
 
 
-def _curve_track_png(result, well: str, model_key: str) -> io.BytesIO:
-    curves = result.curves[result.curves["WELL"] == well].sort_values("DEPT")
-    logs = result.data[result.data["WELL"] == well].sort_values("DEPT")
+def _curve_track_png(result, well: str, model_key: str,
+                     curves: pd.DataFrame | None = None,
+                     data: pd.DataFrame | None = None) -> io.BytesIO:
+    """One well's 5-track figure. ``curves``/``data`` default to the training
+    frames (pass ``result.curves_user``/its engineered data for transfer wells)."""
+    curves = (curves if curves is not None else result.curves)
+    data = (data if data is not None else result.data)
+    curves = curves[curves["WELL"] == well].sort_values("DEPT")
+    logs = data[data["WELL"] == well].sort_values("DEPT")
     fig, axes = plt.subplots(1, 5, figsize=(10.5, 8.0), sharey=True)
     # input logs for context
     for ax, (col, ttl) in zip(axes[:2], [("GR", "GR (API)"), ("RHOB", "RHOB (g/cc)")]):
@@ -221,8 +227,17 @@ def _df_table(df: pd.DataFrame, styles, font_size: int = 7) -> Table:
     return t
 
 
-def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)") -> bytes:
-    """Render the full experiment report as a PDF and return its bytes."""
+def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)",
+                    wells: list[str] | None = None) -> bytes:
+    """Render the full experiment report as a PDF and return its bytes.
+
+    Parameters
+    ----------
+    result : finished experiment (or prediction-only result from a loaded bundle).
+    data_source_label : provenance string printed on the cover.
+    wells : wells to include as curve-track examples (default: first training well;
+    transfer wells from ``curves_user`` are appended automatically).
+    """
     if not _REPORTLAB:
         raise ImportError("reportlab is required for PDF export: pip install reportlab")
 
@@ -255,6 +270,15 @@ def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)") 
     story.append(Spacer(1, 10))
 
     best = result.metrics.loc[result.metrics.groupby("Target")["R2"].idxmax()]
+    if result.metrics.empty:
+        mode = ("Mode: PREDICTION-ONLY - predictions from a loaded model bundle "
+                "(no cross-validation in this run).")
+    elif result.curves_user is not None:
+        mode = (f"Mode: TRANSFER - trained on {result.groups.nunique()} training wells, "
+                f"applied to {result.curves_user['WELL'].nunique()} uploaded well(s) "
+                f"without core control.")
+    else:
+        mode = None
     bullets = [
         f"Feature set: {cfg.feature_set} ({len(result.feature_names)} features: "
         + ", ".join(result.feature_names) + ")",
@@ -265,6 +289,8 @@ def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)") 
         f"Prediction intervals: QRF + well-wise split conformal at "
         f"{1 - cfg.alpha:.0%} nominal coverage.",
     ]
+    if mode:
+        bullets.insert(0, mode)
     for _, row in best.iterrows():
         bullets.append(f"Best model for {row['Target']}: {row['Model']} "
                        f"(blind-well R2 = {row['R2']:+.3f}, RMSE = "
@@ -292,23 +318,26 @@ def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)") 
     story.append(PageBreak())
 
     # ---- 2. Performance ----------------------------------------------------
-    story.append(Paragraph("1. Blind-well performance", h2))
-    story.append(_df_table(result.metrics, ss))
-    story.append(Spacer(1, 8))
-    story.append(Image(_crossplot_grid_png(result), width=17.2 * cm,
-                       height=17.2 * cm * 0.62))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph("Crossplots pool every out-of-fold prediction: each point "
-                           "comes from a model that never saw that well during "
-                           "training.", small))
-    story.append(PageBreak())
+    has_cv = (not result.metrics.empty) and bool(result.cv)
+    if has_cv:
+        story.append(Paragraph("1. Blind-well performance", h2))
+        story.append(_df_table(result.metrics, ss))
+        story.append(Spacer(1, 8))
+        story.append(Image(_crossplot_grid_png(result), width=17.2 * cm,
+                           height=17.2 * cm * 0.62))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Crossplots pool every out-of-fold prediction: each point "
+                               "comes from a model that never saw that well during "
+                               "training.", small))
+        story.append(PageBreak())
 
     # ---- 3. Per-fold / per-well detail --------------------------------------
-    story.append(Paragraph("2. Fold-level detail", h2))
     key0 = result.config.model_keys[0]
-    story.append(Paragraph(_safe(f"Model: {MODEL_SPECS[key0].label}"), body))
-    story.append(_df_table(result.cv[key0].fold_metrics.drop(columns=["TEST_WELLS"]), ss))
-    story.append(Spacer(1, 10))
+    if has_cv:
+        story.append(Paragraph("2. Fold-level detail", h2))
+        story.append(Paragraph(_safe(f"Model: {MODEL_SPECS[key0].label}"), body))
+        story.append(_df_table(result.cv[key0].fold_metrics.drop(columns=["TEST_WELLS"]), ss))
+        story.append(Spacer(1, 10))
 
     from geomech_logml.pipeline import interval_coverage_summary
     cov = interval_coverage_summary(result)
@@ -328,14 +357,33 @@ def build_pdf_bytes(result, data_source_label: str = "synthetic (Agbada-like)") 
     story.append(PageBreak())
 
     # ---- 4. Curves + SHAP ----------------------------------------------------
-    story.append(Paragraph("4. Example prediction curves", h2))
-    well = sorted(result.curves["WELL"].unique())[0]
+    story.append(Paragraph("4. Prediction curves", h2))
+    key0 = result.config.model_keys[0]
+    train_wells = sorted(result.curves["WELL"].unique())
+    user_wells = (sorted(result.curves_user["WELL"].unique())
+                  if result.curves_user is not None else [])
+    chosen = ([w for w in wells if w in train_wells or w in user_wells]
+              if wells else [train_wells[0]])
+    if not chosen:
+        chosen = [train_wells[0]]
     story.append(Paragraph(_safe(
-        f"Well {well}; blue = prediction, shaded = {1 - cfg.alpha:.0%} conformal band, "
-        f"grey = ground truth (synthetic), red = core plugs."), body))
-    story.append(Image(_curve_track_png(result, well, key0), width=17.2 * cm,
-                       height=17.2 * cm * 0.78))
-    shap_img = _shap_png(result)
+        f"Blue = prediction, shaded = {1 - cfg.alpha:.0%} conformal band, "
+        f"grey = ground truth where available, red = core plugs. "
+        f"Wells shown: {', '.join(chosen)}."), body))
+    for i, well in enumerate(chosen):
+        if i > 0:
+            story.append(PageBreak())
+        if well in train_wells:
+            story.append(Image(_curve_track_png(result, well, key0), width=17.2 * cm,
+                               height=17.2 * cm * 0.78))
+        else:  # transfer well (prediction-only, no truth/core)
+            story.append(Paragraph(_safe(f"Well {well} (uploaded, transfer mode - "
+                                         f"no ground truth)"), body))
+            story.append(Image(_curve_track_png(result, well, key0,
+                                                curves=result.curves_user,
+                                                data=result.data_user),
+                               width=17.2 * cm, height=17.2 * cm * 0.78))
+    shap_img = _shap_png(result) if len(result.X_core) > 0 else None
     if shap_img is not None:
         story.append(PageBreak())
         story.append(Paragraph("5. Global SHAP explanation (UCS)", h2))

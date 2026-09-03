@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from geomech_logml.config import TARGETS, TARGET_LABELS, TARGET_UNITS
+from geomech_logml.config import TARGETS, TARGET_LABELS, TARGET_UNITS, WELL_COL
 from geomech_logml.pipeline import ExperimentResult, interval_coverage_summary
 
 __all__ = ["build_report", "save_report"]
@@ -31,6 +31,18 @@ def build_report(res: ExperimentResult, data_source: str = "synthetic (Agbada-li
     lines.append("")
 
     # 1. Executive summary
+    if res.metrics.empty:
+        lines.append("> **PREDICTION-ONLY RUN** — predictions come from a loaded model "
+                     "bundle. No cross-validation results are included; treat intervals "
+                     "as indicative until core control is available.")
+        lines.append("")
+    elif res.curves_user is not None:
+        lines.append("> **TRANSFER MODE** — the models were trained on the training "
+                     "wells only and applied to uploaded wells without core control. "
+                     "Metrics below refer to the training-domain (blind-well) "
+                     "validation; the uploaded-well predictions carry the same "
+                     "calibrated intervals but no ground-truth verification.")
+        lines.append("")
     best = res.metrics.loc[res.metrics.groupby("Target")["R2"].idxmax()]
     lines.append("## 1. Executive summary")
     lines.append("")
@@ -83,6 +95,19 @@ def build_report(res: ExperimentResult, data_source: str = "synthetic (Agbada-li
         lines.append("")
         lines.append("*Coverage values near the nominal level indicate calibrated intervals; "
                      "deviations reflect genuine well-to-well heterogeneity (not row leakage).*")
+        lines.append("")
+
+    # 4b. Transfer predictions
+    if res.curves_user is not None:
+        lines.append("## 4b. Applied predictions (uploaded wells)")
+        lines.append("")
+        n_user = res.curves_user[WELL_COL].nunique()
+        lines.append(f"- Uploaded wells predicted: **{n_user}** "
+                     f"({', '.join(sorted(res.curves_user[WELL_COL].unique()))})")
+        lines.append("- No ground truth available for these wells — intervals, not "
+                     "points, should drive interpretation.")
+        lines.append("- Predictions become decision-grade once core control "
+                     "(even a few plugs) is supplied and the models retrained.")
         lines.append("")
 
     # 5. Usage guidance

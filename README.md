@@ -33,6 +33,14 @@ streamlit run geomech_logml/app/streamlit_app.py
 
 The app opens with a synthetic Agbada-like dataset pre-configured — press **🚂 Train & validate** and the full experiment (3 models × well-wise CV × interval validation) completes in ~1 minute on a laptop.
 
+**What you can do in the dashboard (v0.3)**
+
+- Upload your own **LAS/CSV** wells — with core targets (`E_STAT/NU_STAT/UCS/IS_CORE`) you train on your data; without them the app runs **transfer mode** (trains on synthetic Agbada data, predicts your wells, clearly flagged as indicative).
+- **⚙️ Advanced hyperparameters** (sidebar): trees/depth/leaf for RF, rounds/depth/η for XGBoost, architecture/L2/iterations for the MLP.
+- **Depth-window selector** on the prediction-curve tab for zooming into a reservoir zone.
+- **Export**: curves + metrics (CSV), trained **model bundle (.joblib)**, and a **multi-page PDF report** (choose which wells appear as full-page curve tracks) + Markdown report.
+- **Load trained model** (sidebar §1b): reuse an exported bundle on new wells instantly — prediction-only mode, no retraining.
+
 **Docker alternative**
 
 ```bash

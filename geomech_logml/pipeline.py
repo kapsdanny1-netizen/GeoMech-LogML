@@ -85,13 +85,27 @@ class ExperimentResult:
     curves: pd.DataFrame                    # full-curve point predictions + conformal PI
     final_models: dict[str, dict]           # model_key -> {target: estimator}
     runtime_seconds: float
+    curves_user: pd.DataFrame | None = None  # transfer mode: predictions on a
+                                             # separate (e.g. uploaded) log frame
+    data_user: pd.DataFrame | None = None    # transfer mode: engineered frame of
+                                             # the uploaded logs (for plots/PDF)
 
 
 # ---------------------------------------------------------------------------
 # Experiment
 # ---------------------------------------------------------------------------
-def run_experiment(df_raw: pd.DataFrame, cfg: ExperimentConfig | None = None) -> ExperimentResult:
-    """Run the complete train/evaluate/predict cycle on a canonical log frame."""
+def run_experiment(df_raw: pd.DataFrame, cfg: ExperimentConfig | None = None,
+                   predict_on: pd.DataFrame | None = None) -> ExperimentResult:
+    """Run the complete train/evaluate/predict cycle on a canonical log frame.
+
+    Parameters
+    ----------
+    df_raw : training log frame (must contain core-calibrated rows).
+    cfg : experiment configuration.
+    predict_on : optional *separate* raw log frame to predict after training
+        (transfer mode: e.g. train on synthetic/cored data, apply to uploaded
+        legacy wells). Results land in ``ExperimentResult.curves_user``.
+    """
     cfg = cfg or ExperimentConfig()
     t0 = time.perf_counter()
 
@@ -156,12 +170,20 @@ def run_experiment(df_raw: pd.DataFrame, cfg: ExperimentConfig | None = None) ->
     final_models = {k: res.final_models for k, res in cv_results.items()}
     curves = predict_curves(data, feats, final_models, cv_results, alpha=cfg.alpha)
 
+    curves_user = None
+    data_user = None
+    if predict_on is not None:
+        data_user = engineer_features(clean_logs(predict_on))
+        curves_user = predict_curves(data_user, feats, final_models, cv_results,
+                                     alpha=cfg.alpha)
+
     return ExperimentResult(
         config=cfg, data=data, X_core=X, Y_core=Y, groups=groups, feature_names=feats,
         cv=cv_results, metrics=table,
         honest_conformal=honest_conformal, qrf_oof=qrf_oof,
         curves=curves, final_models=final_models,
         runtime_seconds=time.perf_counter() - t0,
+        curves_user=curves_user, data_user=data_user,
     )
 
 
@@ -182,7 +204,8 @@ def predict_curves(
     sub = data.loc[mask]
     Xc = sub[feature_names].astype(float)
 
-    out = sub[[WELL_COL, DEPTH_COL, CORE_FLAG]].copy()
+    id_cols = [WELL_COL, DEPTH_COL] + ([CORE_FLAG] if CORE_FLAG in sub.columns else [])
+    out = sub[id_cols].copy()
     for truth_col in TARGETS:
         if truth_col in sub.columns:
             out[f"{truth_col}_TRUE"] = sub[truth_col].to_numpy()

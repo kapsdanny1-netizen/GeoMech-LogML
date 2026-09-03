@@ -12,6 +12,7 @@ export CSV + a markdown report.
 
 from __future__ import annotations
 
+import json
 import time
 
 import matplotlib
@@ -30,6 +31,12 @@ from geomech_logml.config import (
 from geomech_logml.data.las_io import load_any
 from geomech_logml.data.synthetic import SyntheticConfig, generate_dataset
 from geomech_logml.models.registry import DEFAULT_MODELS, MODEL_SPECS
+from geomech_logml.models.persistence import (
+    bundle_from_bytes,
+    bundle_from_result,
+    bundle_to_bytes,
+    result_from_bundle,
+)
 from geomech_logml.pipeline import (
     ExperimentConfig,
     ExperimentResult,
@@ -97,13 +104,21 @@ def _train_experiment(
     data: pd.DataFrame, feature_set: str, models: tuple[str, ...],
     cv_strategy: str, n_splits: int, alpha: float, seed: int,
     fast_mlp: bool, validate_uncertainty: bool,
+    hyper_json: str = "{}",
+    predict_on: pd.DataFrame | None = None,
 ) -> ExperimentResult:
-    overrides = {"mlp": {"max_iter": 1200, "hidden_layer_sizes": (48, 24)}} if fast_mlp else None
+    overrides = json.loads(hyper_json) if hyper_json else {}
+    if "mlp" in overrides and isinstance(overrides["mlp"].get("hidden_layer_sizes"), str):
+        import ast as _ast
+        overrides["mlp"]["hidden_layer_sizes"] = _ast.literal_eval(
+            overrides["mlp"]["hidden_layer_sizes"])
+    if fast_mlp and "mlp" not in overrides:
+        overrides["mlp"] = {"max_iter": 1200, "hidden_layer_sizes": (48, 24)}
     cfg = ExperimentConfig(
         feature_set=feature_set, model_keys=list(models), cv_strategy=cv_strategy,
         n_splits=int(n_splits), alpha=float(alpha), seed=int(seed),
         hyper_overrides=overrides, validate_uncertainty=validate_uncertainty)
-    return run_experiment(data, cfg)
+    return run_experiment(data, cfg, predict_on=predict_on)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +172,34 @@ if missing:
     st.stop()
 
 # ---------------------------------------------------------------------------
+# Sidebar — trained-model loader (prediction-only mode)
+# ---------------------------------------------------------------------------
+st.sidebar.header("1b · Load trained model (optional)")
+model_file = st.sidebar.file_uploader(
+    "Model bundle (.joblib)", type=["joblib"],
+    help="Reuse a model exported from a previous run: predict the current data "
+         "without retraining (no cross-validation).")
+if model_file is not None:
+    try:
+        st.session_state["bundle"] = bundle_from_bytes(model_file.getvalue())
+        b = st.session_state["bundle"]
+        st.sidebar.success(f"{b['model_label']} · {len(b['feature_names'])} features · "
+                           f"trained {b.get('created', '?')}")
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"Invalid model bundle: {e}")
+        st.session_state.pop("bundle", None)
+if st.session_state.get("bundle") and st.sidebar.button(
+        "⚡ Predict with loaded model (skip training)"):
+    try:
+        with st.spinner("Applying loaded model to the current data …"):
+            st.session_state["result"] = result_from_bundle(data, st.session_state["bundle"])
+            st.session_state["pred_only"] = True
+            st.session_state.pop("result_sig", None)
+        st.toast("Prediction-only run complete", icon="⚡")
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"Prediction failed: {e}")
+
+# ---------------------------------------------------------------------------
 # Sidebar — training controls
 # ---------------------------------------------------------------------------
 st.sidebar.header("2 · Training setup")
@@ -186,21 +229,65 @@ alpha = st.sidebar.slider("Interval miscoverage α (0.10 = 90% PIs)",
                                "(α = 0.10 → 90% intervals).")
 fast_mlp = st.sidebar.checkbox("Fast MLP mode (fewer iterations)", value=True,
                                help="Quicker training; uncheck for final runs.")
+
+# --- advanced hyper-parameters (only for the selected models) ----------------
+hyper: dict[str, dict] = {}
+with st.sidebar.expander("⚙️ Advanced — model hyperparameters"):
+    if "random_forest" in model_keys:
+        c = st.columns(3)
+        hyper["random_forest"] = {
+            "n_estimators": int(c[0].number_input("RF trees", 50, 1000, 300, 50)),
+            "max_depth": int(c[1].number_input("RF max depth (0=none)", 0, 30, 0)),
+            "min_samples_leaf": int(c[2].number_input("RF min leaf", 1, 10, 2)),
+        }
+        if hyper["random_forest"]["max_depth"] == 0:
+            hyper["random_forest"]["max_depth"] = None
+    if "xgboost" in model_keys:
+        c = st.columns(3)
+        hyper["xgboost"] = {
+            "n_estimators": int(c[0].number_input("XGB rounds", 50, 2000, 600, 50)),
+            "max_depth": int(c[1].number_input("XGB depth", 2, 10, 5)),
+            "learning_rate": float(c[2].number_input("XGB rate", 0.01, 0.30, 0.05, 0.01)),
+        }
+    if "mlp" in model_keys:
+        c = st.columns(3)
+        sizes = st.selectbox("MLP hidden layers", ["(48, 24)", "(64, 32)", "(128, 64)", "(96, 48, 24)"])
+        hyper["mlp"] = {
+            "hidden_layer_sizes": eval(sizes),  # noqa: S307 — fixed option list above
+            "alpha": float(c[1].number_input("MLP L2", 1e-5, 1e-1, 1e-3, 1e-4, format="%.5f")),
+            "max_iter": int(c[2].number_input("MLP iters", 200, 5000, 1200, 100)),
+        }
+hyper_json = json.dumps({k: v for k, v in hyper.items()}, default=str)
+
 train_btn = st.sidebar.button("🚂 Train & validate", type="primary", width="stretch")
 
 # ---------------------------------------------------------------------------
 # Session state & experiment execution
 # ---------------------------------------------------------------------------
+# Transfer mode: uploaded logs without core targets -> train on synthetic,
+# predict the uploaded wells with the fitted models.
+has_targets = all(t in data.columns for t in TARGETS)
+transfer_mode = not has_targets
+
 if train_btn and model_keys:
     t0 = time.perf_counter()
-    with st.spinner(f"Training {len(model_keys)} model(s) under well-wise CV …"):
+    if transfer_mode:
+        train_df = _generate_cached(8, GLOBAL_SEED, 1.0, True)
+        predict_df = data
+        msg = "Training on synthetic Agbada data, then predicting your uploaded wells (transfer mode) …"
+    else:
+        train_df = data
+        predict_df = None
+        msg = f"Training {len(model_keys)} model(s) under well-wise CV …"
+    with st.spinner(msg):
         result = _train_experiment(
-            data, feature_set, tuple(model_keys), cv_strategy, n_splits,
-            float(alpha), GLOBAL_SEED, fast_mlp, True)
+            train_df, feature_set, tuple(model_keys), cv_strategy, n_splits,
+            float(alpha), GLOBAL_SEED, fast_mlp, True, hyper_json, predict_df)
     st.session_state["result"] = result
+    st.session_state["pred_only"] = False
     st.session_state["result_sig"] = (feature_set, tuple(model_keys), cv_strategy,
                                       n_splits, float(alpha), len(data))
-    st.toast(f"Training complete in {time.perf_counter() - t0:.0f}s", icon="✅")
+    st.toast(f"Done in {time.perf_counter() - t0:.0f}s", icon="✅")
 
 result: ExperimentResult | None = st.session_state.get("result")
 if result is not None:
@@ -222,15 +309,35 @@ m2.metric("Log rows (cleaned)", f"{len(qc):,}")
 m3.metric("Core-plug rows", f"{int(qc.get(CORE_FLAG, pd.Series(dtype=int)).sum()):,}")
 m4.metric("Vp available", "yes" if "VP" in qc.columns else "no — legacy mode")
 
+if result is None and transfer_mode:
+    st.warning("⚠️ **Transfer mode** — your uploaded files have no core-target columns "
+               "(E_STAT / NU_STAT / UCS). Pressing **Train & validate** will train on a "
+               "synthetic Agbada dataset and apply the models to your wells. Predictions "
+               "are indicative until real core control is added. Alternatively load a "
+               "previously exported model bundle (sidebar §1b).")
 if result is None:
     st.info("👈 Configure the experiment in the sidebar and press **Train & validate** "
             "to see results. Everything is computed with **well-wise** cross-validation — "
             "models are always tested on wells they have never seen.")
 
+if result is not None:
+    if st.session_state.get("pred_only"):
+        st.info("⚡ **Prediction-only run** — curves come from a loaded model bundle. "
+                "Cross-validation tabs are disabled; use **Train & validate** for full "
+                "validation.")
+    elif transfer_mode and result.curves_user is not None:
+        st.warning("⚠️ **Transfer mode** — models were trained on synthetic Agbada data "
+                   "and applied to your uploaded wells (no core control). Interval bands "
+                   "are carried over from the synthetic calibration; treat absolute "
+                   "values as indicative and add core data for decision-grade work.")
+
 tab_labels = ["📊 Data & QC", "🎯 Training & CV", "📈 Prediction curves",
               "🌀 Uncertainty", "🔍 SHAP", "🏆 Compare & Export"]
 tabs = st.tabs(tab_labels)
 _NOT_TRAINED = "👈 Train & validate in the sidebar to enable this tab."
+_PRED_ONLY = ("⚡ Prediction-only run — this tab needs cross-validation results. "
+              "Press **Train & validate** or see the **📈 Prediction curves** and "
+              "**🏆 Compare & Export** tabs.")
 
 # ===========================================================================
 # TAB 1 — Data & QC
@@ -282,6 +389,9 @@ with tabs[0]:
 with tabs[1]:
     if result is None:
         st.info(_NOT_TRAINED)
+        st.stop()
+    if not result.cv or result.metrics.empty:
+        st.info(_PRED_ONLY)
         st.stop()
     st.subheader("Blind-well performance (pooled out-of-fold predictions)")
     st.markdown("Every metric below is computed on **wells entirely held out of training** "
@@ -337,37 +447,79 @@ with tabs[2]:
         st.info(_NOT_TRAINED)
         st.stop()
     st.subheader("Continuous property curves with uncertainty bands")
+    # training-well curves + (transfer mode) uploaded-well curves in one view
+    curves = result.curves
+    data_for_wells = result.data
+    if result.curves_user is not None:
+        curves = pd.concat([result.curves, result.curves_user], ignore_index=True)
+        data_for_wells = pd.concat([result.data, result.data_user], ignore_index=True)
+    if st.session_state.get("pred_only"):
+        curves = result.curves
+        data_for_wells = result.data
+
     pcols = st.columns(4)
-    well_opts = sorted(result.curves[WELL_COL].unique())
+    well_opts = sorted(curves[WELL_COL].unique())
     curve_well = pcols[0].selectbox("Well", well_opts, key="curve_well")
     curve_model = pcols[1].selectbox("Model", result.config.model_keys,
                                      format_func=lambda k: MODEL_SPECS[k].label,
                                      key="curve_model")
-    show_qrf = pcols[2].checkbox("Add QRF band (Random Forest)",
-                                 disabled=("random_forest" not in result.config.model_keys),
+    can_qrf = ("random_forest" in result.config.model_keys
+               and len(result.Y_core) > 0 and not result.metrics.empty)
+    show_qrf = pcols[2].checkbox("Add QRF band (Random Forest)", disabled=not can_qrf,
                                  help="Quantile Regression Forest intervals — per-row, "
                                       "wider where the training data disagree.")
     depth_only = pcols[3].empty()
 
-    curves = result.curves
-    if show_qrf:
+    # depth-range selector (zoom into a reservoir zone)
+    w_all = curves[curves[WELL_COL] == curve_well]
+    dmin, dmax = float(w_all[DEPTH_COL].min()), float(w_all[DEPTH_COL].max())
+    full_depth = depth_only.checkbox("Full well", value=True, key="full_depth")
+    if full_depth:
+        curves_view = curves
+    else:
+        dr = st.slider("Depth window (m)", dmin, dmax, (dmin, dmax),
+                       (dmax - dmin) / 200.0, key="depth_win")
+        curves_view = curves[curves[DEPTH_COL].between(*dr)]
+
+    if show_qrf and can_qrf:
         with st.spinner("Computing QRF bands for this well …"):
-            w_mask = (curves[WELL_COL] == curve_well)
-            feat_cols = result.feature_names
-            X_curve = result.data.loc[result.data[WELL_COL] == curve_well, feat_cols]
-            X_curve = X_curve.astype(float)
-            qrf = qrf_curve_intervals(result.X_core, result.Y_core, X_curve,
-                                      alpha=result.config.alpha, seed=result.config.seed)
-            for col in qrf.columns:
-                curves.loc[w_mask, col] = qrf[col].to_numpy()
+            w_view = curves_view[curves_view[WELL_COL] == curve_well]
+            d_lo = float(w_view[DEPTH_COL].min()) - 1e-6
+            d_hi = float(w_view[DEPTH_COL].max()) + 1e-6
+            X_curve = data_for_wells.loc[
+                (data_for_wells[WELL_COL] == curve_well)
+                & data_for_wells[DEPTH_COL].between(d_lo, d_hi),
+                result.feature_names].astype(float)
+            if len(X_curve) == len(w_view):     # same rows, same order per well
+                qrf = qrf_curve_intervals(result.X_core, result.Y_core, X_curve,
+                                          alpha=result.config.alpha,
+                                          seed=result.config.seed)
+                curves_view = curves_view.copy()
+                curves_view.loc[w_view.index, list(qrf.columns)] = qrf.to_numpy()
+            else:                               # alignment fallback: join on depth
+                qrf = qrf_curve_intervals(result.X_core, result.Y_core, X_curve,
+                                          alpha=result.config.alpha,
+                                          seed=result.config.seed)
+                qrf.index = X_curve[DEPTH_COL].round(3).to_numpy()
+                curves_view = curves_view.copy()
+                for col in qrf.columns:
+                    curves_view.loc[w_view.index, col] = w_view[DEPTH_COL].round(3) \
+                        .map(qrf[col]).to_numpy()
+                show_qrf = not curves_view[[c for c in qrf.columns
+                                            if c in curves_view]].isna().any().any()
+    else:
+        curves_view = curves_view
+
     st.plotly_chart(
-        prediction_track_figure(curves, curve_well, curve_model,
-                                include_qrf=show_qrf, alpha=result.config.alpha),
+        prediction_track_figure(curves_view, curve_well, curve_model,
+                                include_qrf=show_qrf and can_qrf,
+                                alpha=result.config.alpha),
         width="stretch")
 
-    st.caption("Grey = ground truth (synthetic) · blue = prediction · shaded = conformal "
-               "90% prediction interval · dashed orange = QRF interval · red diamonds = "
-               "core plugs used in training.")
+    st.caption("Grey = ground truth (where available) · blue = prediction · shaded = "
+               "conformal prediction interval · dashed orange = QRF interval · red "
+               "diamonds = core plugs used in training. Transfer wells show predictions "
+               "only (no truth).")
 
 # ===========================================================================
 # TAB 4 — Uncertainty
@@ -375,6 +527,9 @@ with tabs[2]:
 with tabs[3]:
     if result is None:
         st.info(_NOT_TRAINED)
+        st.stop()
+    if result.honest_conformal is None and result.qrf_oof is None:
+        st.info(_PRED_ONLY)
         st.stop()
     st.subheader("Prediction-interval validation (honest, out-of-well)")
     st.markdown("Both interval methods are validated on wells that were **never seen** "
@@ -502,46 +657,85 @@ with tabs[5]:
     if result is None:
         st.info(_NOT_TRAINED)
         st.stop()
-    st.subheader("Side-by-side model comparison")
-    pivot = result.metrics.pivot(index="Model", columns="Target", values="R2")
-    st.dataframe(pivot.style.highlight_max(axis=0, color="#c8e6c9").format("{:.3f}"),
-                 width="stretch")
-    st.caption("Cells show blind-well R². Green = best model per target.")
+    has_cv = bool(result.cv) and not result.metrics.empty
+    if has_cv:
+        st.subheader("Side-by-side model comparison")
+        pivot = result.metrics.pivot(index="Model", columns="Target", values="R2")
+        st.dataframe(pivot.style.highlight_max(axis=0, color="#c8e6c9").format("{:.3f}"),
+                     width="stretch")
+        st.caption("Cells show blind-well R². Green = best model per target.")
 
-    st.markdown("#### Feature-set ablation — does Vp help?")
-    abl_key = ("ablation", result.config.seed, result.config.cv_strategy)
-    if st.button("⚗️ Run ablation (with vs without Vp)", key="abl_btn"):
-        with st.spinner("Re-running both feature sets under well-wise CV …"):
-            abl = run_ablation(result.data, result.config)
-            st.session_state[abl_key] = abl
-    if abl_key in st.session_state:
-        abl = st.session_state[abl_key]
-        st.dataframe(abl, width="stretch", hide_index=True)
-        st.plotly_chart(ablation_delta_figure(abl), width="stretch")
-        st.caption("`dR2_Vp` > 0 means the sonic log improved blind-well accuracy. "
-                   "Even without Vp the models remain usable — that is the point of the "
-                   "legacy-suite feature set.")
+        st.markdown("#### Feature-set ablation — does Vp help?")
+        abl_key = ("ablation", result.config.seed, result.config.cv_strategy)
+        if st.button("⚗️ Run ablation (with vs without Vp)", key="abl_btn"):
+            with st.spinner("Re-running both feature sets under well-wise CV …"):
+                abl = run_ablation(result.data, result.config)
+                st.session_state[abl_key] = abl
+        if abl_key in st.session_state:
+            abl = st.session_state[abl_key]
+            st.dataframe(abl, width="stretch", hide_index=True)
+            st.plotly_chart(ablation_delta_figure(abl), width="stretch")
+            st.caption("`dR2_Vp` > 0 means the sonic log improved blind-well accuracy. "
+                       "Even without Vp the models remain usable — that is the point of "
+                       "the legacy-suite feature set.")
 
     st.markdown("---")
     st.subheader("Export")
+
+    # --- trained-model bundle (feature: reuse without retraining) ------------
+    if has_cv:
+        st.markdown("#### Trained model")
+        dl_key = st.selectbox("Model to export",
+                              result.config.model_keys,
+                              format_func=lambda k: MODEL_SPECS[k].label,
+                              key="dl_model")
+        if st.button("📦 Build model bundle (.joblib)", key="bundle_btn"):
+            try:
+                st.session_state["bundle_bytes"] = bundle_to_bytes(
+                    bundle_from_result(result, dl_key))
+                st.toast("Bundle ready", icon="📦")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Bundle creation failed: {e}")
+        if "bundle_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download trained model (.joblib)",
+                st.session_state["bundle_bytes"],
+                file_name=f"geomech_{dl_key}.joblib",
+                mime="application/octet-stream",
+                help="Load this file later via sidebar §1b to predict new wells "
+                     "without retraining.")
+            st.caption(f"Size: {len(st.session_state['bundle_bytes']) / 1024:.0f} KB")
+
     e1, e2 = st.columns(2)
+    export_curves = (pd.concat([result.curves, result.curves_user], ignore_index=True)
+                     if result.curves_user is not None else result.curves)
     with e1:
         st.download_button("⬇️ Curve predictions (CSV)",
-                           result.curves.to_csv(index=False).encode(),
+                           export_curves.to_csv(index=False).encode(),
                            file_name="geomech_curve_predictions.csv", mime="text/csv")
     with e2:
         st.download_button("⬇️ Metrics (CSV)",
                            result.metrics.to_csv(index=False).encode(),
-                           file_name="geomech_metrics.csv", mime="text/csv")
+                           file_name="geomech_metrics.csv", mime="text/csv",
+                           disabled=not has_cv)
 
     st.markdown("#### Full report")
     if pdf_available():
+        all_pdf_wells = sorted(result.curves[WELL_COL].unique()) + (
+            sorted(result.curves_user[WELL_COL].unique())
+            if result.curves_user is not None else [])
+        pdf_wells = st.multiselect(
+            "Wells to include as curve examples", all_pdf_wells,
+            default=all_pdf_wells[:1], key="pdf_wells",
+            help="One full-page track per well (training wells show truth + core; "
+                 "transfer wells show predictions + intervals only).")
         if st.button("🧾 Generate PDF report (charts + tables)", key="pdf_btn",
                      help="Multi-page PDF: summary, methodology, crossplots, "
                           "interval validation, example curves, SHAP."):
             with st.spinner("Rendering PDF report …"):
                 try:
-                    st.session_state["pdf_bytes"] = build_pdf_bytes(result, data_source_label)
+                    st.session_state["pdf_bytes"] = build_pdf_bytes(
+                        result, data_source_label, wells=pdf_wells)
                 except Exception as e:  # noqa: BLE001
                     st.error(f"PDF generation failed: {e}")
         if "pdf_bytes" in st.session_state:
@@ -562,6 +756,6 @@ with tabs[5]:
         st.markdown(build_report(result, data_source_label))
 
 st.sidebar.divider()
-st.sidebar.caption("GeoMech-LogML v0.2 · research prototype\n\n"
+st.sidebar.caption("GeoMech-LogML v0.3 · research prototype\n\n"
                    "Inputs: GR, RHOB, NPHI, RT (+ optional Vp) — no shear sonic "
                    "required anywhere in the workflow.")
