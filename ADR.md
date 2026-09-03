@@ -19,3 +19,13 @@ One page, one table per decision: context → decision → rejected alternatives
 | 11 | **CLI + library + app share one pipeline** | Same experiment from three doorways (app, notebook, terminal). | `pipeline.run_experiment` is the single orchestrator; `scripts/train_eval.py` and the app both call it; reports generated from the same builder. | Duplicate logic per surface. | Metrics/methods cannot diverge between UI and CLI outputs. |
 
 **Key trade-off accepted:** honest well-wise validation + honest interval reporting *cost* some headline accuracy vs. leaked random-split scores seen in parts of the literature — that is deliberate and is the project's core methodological stance.
+
+---
+
+## Addendum — v0.2 (dashboard hardening & professional reporting)
+
+| # | Decision | Context | Choice & rationale |
+|---|----------|---------|--------------------|
+| 12 | **Slider `format` = single printf specifier** | A frontend `[sprintf] expecting number` crash was traced to a two-specifier format string (`"%.2f → %.0f%%"`) on the α slider; Streamlit's JS formatter passes exactly one value. | Format strings on sliders use exactly one `%` specifier; meaning moved into the label. |
+| 13 | **PDF export via reportlab + matplotlib** | Users need a shareable, printable deliverable (CSV/Markdown insufficient for management/review). | Pure-Python `reportlab` (no system binaries like wkhtmltopdf/WeasyPrint → works in Docker/sandbox). Multi-page report assembles existing matplotlib figure builders (crossplot grid, calibration panel, curve track, SHAP beeswarm) + styled tables. Latin-1-safe text via transliteration (`ν→nu`, `→→->`). Button-flow (generate → download) avoids re-rendering the PDF on every rerun. |
+| 14 | **Expanded result visualisation** | "Every detail" presentation: crossplots, per-well heatmaps, conversion evidence. | Added: blind-well crossplot grid (model × target, R²/RMSE annotated), per-well R² heatmap, per-well interval coverage bars, static–dynamic evidence plot (binned learned relationship vs a fixed 0.5× factor), mean-\|SHAP\| global importance bars, ablation ΔR² chart. All built on the same `ExperimentResult` object — no recomputation. |

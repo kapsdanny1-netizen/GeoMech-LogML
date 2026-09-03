@@ -45,11 +45,17 @@ from geomech_logml.preprocessing.features import (
 )
 from geomech_logml.interpretability.shap_explainer import ShapExplainer
 from geomech_logml.app.plots import (
+    ablation_delta_figure,
     coverage_scatter_figure,
     crossplot_figure,
     log_track_figure,
+    oof_crossplot_grid,
+    per_well_coverage_figure,
+    per_well_metric_heatmap,
     prediction_track_figure,
+    static_dynamic_figure,
 )
+from geomech_logml.app.pdf_report import build_pdf_bytes, pdf_available
 from geomech_logml.app.report import build_report
 
 matplotlib.use("Agg")  # headless-safe rendering for SHAP figures
@@ -174,9 +180,10 @@ cv_strategy = st.sidebar.selectbox("Cross-validation", ["well_kfold", "leave_one
                                    format_func=lambda s: _CV_LABELS[s])
 n_splits = st.sidebar.slider("Folds (wells per fold group)", 2, 10, 5,
                              disabled=(cv_strategy == "leave_one_well_out"))
-alpha = st.sidebar.slider("Interval miscoverage α", 0.05, 0.30, 0.10, 0.05,
-                          format="%.2f → %.0f%% PIs",
-                          help="Prediction intervals target 1−α coverage.")
+alpha = st.sidebar.slider("Interval miscoverage α (0.10 = 90% PIs)",
+                          0.05, 0.30, 0.10, 0.05, format="%.2f",
+                          help="Prediction intervals target 1−α coverage "
+                               "(α = 0.10 → 90% intervals).")
 fast_mlp = st.sidebar.checkbox("Fast MLP mode (fewer iterations)", value=True,
                                help="Quicker training; uncheck for final runs.")
 train_btn = st.sidebar.button("🚂 Train & validate", type="primary", width="stretch")
@@ -291,6 +298,25 @@ with tabs[1]:
                       height=380, legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig, width="stretch")
 
+    st.markdown("#### Blind-well crossplots — truth vs prediction (every model × target)")
+    st.plotly_chart(oof_crossplot_grid(result), width="stretch")
+
+    st.markdown("#### Per-well blind R²")
+    st.plotly_chart(per_well_metric_heatmap(result), width="stretch")
+    st.caption("Each cell is an independent blind test: that well was fully held out "
+               "of training. Cool cells reveal geology the model has not seen — "
+               "candidates for more calibration core.")
+
+    with st.expander("Evidence: the static–dynamic conversion is learned, not fixed"):
+        if "E_DYN" in result.data.columns:
+            st.plotly_chart(static_dynamic_figure(result.data), width="stretch")
+            st.caption("The paired core data define a *curve* (binned mean, orange), "
+                       "not a constant ratio — exactly why GeoMech-LogML regresses "
+                       "static properties directly from logs instead of applying a "
+                       "hard-coded factor (grey dotted line shows why that fails).")
+        else:
+            st.info("E_DYN requires density + sonic data; not present in this dataset.")
+
     sel_model_fold = st.selectbox("Model (fold detail)",
                                   result.config.model_keys,
                                   format_func=lambda k: MODEL_SPECS[k].label,
@@ -371,6 +397,12 @@ with tabs[3]:
         st.plotly_chart(coverage_scatter_figure(method_map[src], t_sel,
                                                 1 - result.config.alpha),
                         width="stretch")
+        st.markdown("#### Per-well coverage")
+        st.plotly_chart(per_well_coverage_figure(method_map[src], t_sel,
+                                                 1 - result.config.alpha),
+                        width="stretch")
+        st.caption("Wells below the dashed nominal line have systematically larger "
+                   "errors — real geological heterogeneity, quantified honestly.")
     st.markdown("#### OOF residual distribution")
     res_df = result.cv[result.config.model_keys[0]].oof
     res_df = res_df[res_df["TARGET"] == t_sel]
@@ -442,6 +474,10 @@ with tabs[4]:
                 fig_dep = explainer.dependence_figure(X_explain, feat)
                 st.pyplot(fig_dep, clear_figure=True)
 
+        st.markdown("#### Global feature importance (mean |SHAP|)")
+        fig_bar = explainer.mean_abs_shap_figure(X_explain)
+        st.pyplot(fig_bar, clear_figure=True)
+
         st.markdown("#### Per-depth explanation (waterfall)")
         w_sel, d_sel = st.columns(2)
         well_pick = w_sel.selectbox("Well", sorted(result.data[WELL_COL].unique()),
@@ -481,13 +517,14 @@ with tabs[5]:
     if abl_key in st.session_state:
         abl = st.session_state[abl_key]
         st.dataframe(abl, width="stretch", hide_index=True)
+        st.plotly_chart(ablation_delta_figure(abl), width="stretch")
         st.caption("`dR2_Vp` > 0 means the sonic log improved blind-well accuracy. "
                    "Even without Vp the models remain usable — that is the point of the "
                    "legacy-suite feature set.")
 
     st.markdown("---")
     st.subheader("Export")
-    e1, e2, e3 = st.columns(3)
+    e1, e2 = st.columns(2)
     with e1:
         st.download_button("⬇️ Curve predictions (CSV)",
                            result.curves.to_csv(index=False).encode(),
@@ -496,16 +533,35 @@ with tabs[5]:
         st.download_button("⬇️ Metrics (CSV)",
                            result.metrics.to_csv(index=False).encode(),
                            file_name="geomech_metrics.csv", mime="text/csv")
-    with e3:
-        st.download_button("⬇️ Report (Markdown)",
-                           build_report(result, data_source_label).encode(),
-                           file_name="geomech_report.md", mime="text/markdown")
+
+    st.markdown("#### Full report")
+    if pdf_available():
+        if st.button("🧾 Generate PDF report (charts + tables)", key="pdf_btn",
+                     help="Multi-page PDF: summary, methodology, crossplots, "
+                          "interval validation, example curves, SHAP."):
+            with st.spinner("Rendering PDF report …"):
+                try:
+                    st.session_state["pdf_bytes"] = build_pdf_bytes(result, data_source_label)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"PDF generation failed: {e}")
+        if "pdf_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download report (PDF)",
+                st.session_state["pdf_bytes"],
+                file_name="geomech_report.pdf", mime="application/pdf")
+            st.caption(f"Size: {len(st.session_state['pdf_bytes']) / 1024:.0f} KB")
+    else:
+        st.warning("Install `reportlab` to enable PDF export "
+                   "(pip install reportlab). Markdown export is still available.")
+    st.download_button("⬇️ Report (Markdown)",
+                       build_report(result, data_source_label).encode(),
+                       file_name="geomech_report.md", mime="text/markdown")
 
     st.markdown("#### Report preview")
     with st.expander("Show report"):
         st.markdown(build_report(result, data_source_label))
 
 st.sidebar.divider()
-st.sidebar.caption("GeoMech-LogML v0.1 · research prototype\n\n"
+st.sidebar.caption("GeoMech-LogML v0.2 · research prototype\n\n"
                    "Inputs: GR, RHOB, NPHI, RT (+ optional Vp) — no shear sonic "
                    "required anywhere in the workflow.")

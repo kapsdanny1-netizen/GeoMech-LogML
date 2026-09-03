@@ -114,6 +114,17 @@ def test_report_generation(tiny_result):
     assert "R2" in md or "R²" in md
 
 
+def test_pdf_report_generation(tiny_result):
+    """PDF export builds a valid multi-page document with figures and tables."""
+    pytest.importorskip("reportlab")
+    from geomech_logml.app.pdf_report import build_pdf_bytes, pdf_available
+    assert pdf_available()
+    pdf = build_pdf_bytes(tiny_result, "synthetic test")
+    assert pdf[:5] == b"%PDF-" and pdf.rstrip().endswith(b"%%EOF")
+    assert len(pdf) > 50_000          # figures embedded
+    assert pdf.count(b"/Type /Page") >= 4   # multi-page report
+
+
 # ---------------------------------------------------------------------------
 # Streamlit app smoke test (skipped if streamlit.testing unavailable)
 # ---------------------------------------------------------------------------

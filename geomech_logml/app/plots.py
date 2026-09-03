@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from sklearn.metrics import r2_score, root_mean_squared_error
 
 from geomech_logml.config import (
     DEPTH_COL,
@@ -178,4 +180,128 @@ def coverage_scatter_figure(interval_df: pd.DataFrame, target: str,
     fig.update_layout(height=520, xaxis_title="Prediction", yaxis_title="Lab truth",
                       title=f"{target}: empirical coverage {inside:.1%} (nominal {nominal:.0%})",
                       margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Result-explanation figures (training/CV, uncertainty, ablation)
+# ---------------------------------------------------------------------------
+MODEL_SHORT = {"random_forest": "Random Forest", "xgboost": "XGBoost", "mlp": "MLP"}
+
+
+def oof_crossplot_grid(result) -> go.Figure:
+    """Blind-well crossplots: out-of-fold lab truth vs prediction for every
+    model x target, with 1:1 line and R2/RMSE annotations."""
+    model_keys = result.config.model_keys
+    n_r, n_c = len(TARGETS), len(model_keys)
+    fig = make_subplots(rows=n_r, cols=n_c,
+                        subplot_titles=[f"{MODEL_SHORT.get(k, k)} · {t}"
+                                        for _r, t in enumerate(TARGETS)
+                                        for k in model_keys],
+                        horizontal_spacing=0.07, vertical_spacing=0.09)
+    for r, target in enumerate(TARGETS, start=1):
+        for c, key in enumerate(model_keys, start=1):
+            oof = result.cv[key].oof
+            sub = oof[oof["TARGET"] == target]
+            fig.add_trace(go.Scattergl(
+                x=sub["TRUE"], y=sub["PRED"], mode="markers",
+                marker=dict(size=5, opacity=0.65, color="#1A5FB4"),
+                showlegend=False,
+                name=f"{key} {target}"), row=r, col=c)
+            lo = float(min(sub["TRUE"].min(), sub["PRED"].min()))
+            hi = float(max(sub["TRUE"].max(), sub["PRED"].max()))
+            fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
+                                     line=dict(dash="dash", color="#888"),
+                                     showlegend=False), row=r, col=c)
+            r2 = r2_score(sub["TRUE"], sub["PRED"])
+            rmse = root_mean_squared_error(sub["TRUE"], sub["PRED"])
+            fig.add_annotation(
+                xref="x domain", yref="y domain", x=0.04, y=0.96,
+                showarrow=False, font=dict(size=10, color="#B4491F"),
+                text=f"R²={r2:.3f}<br>RMSE={rmse:.2f}", row=r, col=c)
+            fig.update_xaxes(title_text="Lab truth", row=r, col=c)
+            fig.update_yaxes(title_text="Prediction", row=r, col=c)
+    fig.update_layout(height=330 * n_r, margin=dict(l=10, r=10, t=40, b=10),
+                      title_text="Blind-well crossplots (pooled out-of-fold)")
+    return fig
+
+
+def per_well_metric_heatmap(result) -> go.Figure:
+    """Heatmap of per-well blind R2 (rows = wells, columns = model x target)."""
+    rows = []
+    for key in result.config.model_keys:
+        for well, sub in result.cv[key].oof.groupby("WELL"):
+            for target, s2 in sub.groupby("TARGET"):
+                rows.append({"WELL": well, "COL": f"{MODEL_SHORT.get(key, key)} · {target}",
+                             "R2": r2_score(s2["TRUE"], s2["PRED"]) if len(s2) > 2 else np.nan})
+    piv = pd.DataFrame(rows).pivot(index="WELL", columns="COL", values="R2")
+    fig = px.imshow(piv, text_auto=".2f", zmin=0, zmax=1,
+                    color_continuous_scale="RdBu", aspect="auto")
+    fig.update_layout(height=360, title="Per-well blind R² — which wells are hard?",
+                      xaxis_title="", yaxis_title="Well",
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def static_dynamic_figure(data: pd.DataFrame) -> go.Figure:
+    """Evidence plot: E_static vs E_dynamic on core rows (learnable conversion).
+
+    Shows the static/dynamic ratio as a smooth function of rock competence —
+    the relationship the models must learn (never a fixed factor).
+    """
+    core = data[data["IS_CORE"] == 1] if "IS_CORE" in data.columns else data
+    sub = core.dropna(subset=["E_DYN", "E_STAT"])
+    has_vsh = "VSH_TRUE" in sub.columns
+    fig = go.Figure(go.Scattergl(
+        x=sub["E_DYN"], y=sub["E_STAT"], mode="markers",
+        marker=dict(size=5, opacity=0.6,
+                    color=sub["VSH_TRUE"] if has_vsh else "#1A5FB4",
+                    colorscale="Turbo", colorbar=dict(title="Vshale"),
+                    showscale=has_vsh),
+        name="core plugs"))
+    # binned mean relationship (the function the model must learn)
+    bins = pd.cut(sub["E_DYN"], bins=8)
+    trend = sub.groupby(bins, observed=True).agg(x=("E_DYN", "mean"), y=("E_STAT", "mean"))
+    fig.add_trace(go.Scatter(x=trend["x"], y=trend["y"], mode="lines+markers",
+                             line=dict(color="#B4491F", width=3),
+                             name="binned mean (target relationship)"))
+    # a fixed 0.5x factor for contrast
+    lim = float(sub["E_DYN"].max())
+    fig.add_trace(go.Scatter(x=[0, lim], y=[0, 0.5 * lim], mode="lines",
+                             line=dict(dash="dot", color="#777"),
+                             name="fixed 0.5× factor (wrong)"))
+    fig.update_layout(height=480, xaxis_title="E_dynamic (GPa)",
+                      yaxis_title="E_static (GPa)",
+                      title="Static–dynamic relationship on paired core data",
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def per_well_coverage_figure(interval_df: pd.DataFrame, target: str,
+                             nominal: float) -> go.Figure:
+    """Empirical interval coverage per well vs the nominal level."""
+    sub = interval_df[interval_df["TARGET"] == target]
+    cov = sub.groupby("WELL").apply(
+        lambda s: ((s["TRUE"] >= s["LO"]) & (s["TRUE"] <= s["HI"])).mean(),
+        include_groups=False).sort_values()
+    fig = go.Figure(go.Bar(x=cov.index, y=cov.to_numpy(),
+                           marker_color="#1A5FB4", name="coverage"))
+    fig.add_hline(y=nominal, line_dash="dash", line_color="#B4491F",
+                  annotation_text=f"nominal {nominal:.0%}",
+                  annotation_position="top right")
+    fig.update_layout(height=380, yaxis_title="Empirical coverage", yaxis_range=[0, 1.05],
+                      title=f"{target}: interval coverage per well",
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def ablation_delta_figure(abl: pd.DataFrame) -> go.Figure:
+    """ΔR² (with Vp − without Vp) per model × target."""
+    fig = px.bar(abl, x="Target", y="dR2_Vp", color="Model", barmode="group",
+                 color_discrete_sequence=["#1A5FB4", "#B4491F", "#21918C"])
+    fig.add_hline(y=0, line_color="#444")
+    fig.update_layout(height=400, yaxis_title="ΔR² (with Vp − without Vp)",
+                      title="Marginal value of the sonic log (Vp) — blind-well R²",
+                      legend=dict(orientation="h", y=1.15),
+                      margin=dict(l=10, r=10, t=60, b=10))
     return fig

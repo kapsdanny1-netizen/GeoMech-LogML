@@ -11,6 +11,7 @@ GeoMech-LogML predicts **static Young's modulus (E_static, GPa)**, **static Pois
 | **Uncertainty** | Split-conformal prediction (well-wise calibrated) + Quantile Regression Forests |
 | **Explainability** | SHAP beeswarm, dependence plots and per-depth waterfalls for every model |
 | **Interface** | Streamlit dashboard (upload LAS/CSV or generate Agbada-like synthetic data) |
+| **Export** | Curve predictions + metrics (CSV), report (Markdown **and multi-page PDF with charts**) |
 | **Reproducibility** | Fixed seeds, pinned requirements, Dockerfile, pytest suite (39 tests), example notebooks |
 
 ---

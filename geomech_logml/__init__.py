@@ -12,7 +12,7 @@ from geomech_logml.config import (
     GLOBAL_SEED,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BASE_LOGS",

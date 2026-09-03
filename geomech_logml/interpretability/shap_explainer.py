@@ -124,6 +124,22 @@ class ShapExplainer:
         order = np.argsort(means)[::-1]
         return [str(X.columns[i]) for i in order[:k]]
 
+    # ------------------------------------------------------------------
+    def mean_abs_shap_figure(self, X: pd.DataFrame, max_display: int = 12) -> "plt.Figure":
+        """Horizontal bar chart of mean |SHAP| per feature (global importance)."""
+        vals = self.shap_values(X)
+        means = pd.Series(np.abs(vals).mean(axis=0), index=X.columns)
+        means = means.sort_values(ascending=True).tail(max_display)
+        fig, ax = plt.subplots(figsize=(7.5, 0.42 * len(means) + 1.4))
+        ax.barh(means.index, means.to_numpy(), color="#1A5FB4")
+        ax.set_xlabel(f"mean |SHAP value| — {self.target}")
+        ax.set_title(f"Global feature importance ({MODEL_SPECS[self.model_key].label})",
+                     fontsize=11)
+        for i, v in enumerate(means.to_numpy()):
+            ax.text(v, i, f"  {v:.3f}", va="center", fontsize=8, color="#333")
+        fig.tight_layout()
+        return fig
+
 
 def top_features_by_shap(shap_matrix: np.ndarray, feature_names: list[str], k: int = 4) -> list[str]:
     """Utility: rank feature names by mean |SHAP| from a precomputed matrix."""
