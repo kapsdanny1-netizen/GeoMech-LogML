@@ -12,6 +12,15 @@ export CSV + a markdown report.
 
 from __future__ import annotations
 
+# Import bootstrap: make the package importable on Streamlit Cloud,
+# which runs this nested file directly (repo root not on sys.path).
+import sys as _sys
+from pathlib import Path as _Path
+
+_PKG_ROOT = _Path(__file__).resolve().parents[2]
+if str(_PKG_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_PKG_ROOT))
+    
 import json
 import time
 
